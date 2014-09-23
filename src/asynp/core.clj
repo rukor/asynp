@@ -5,14 +5,15 @@
   (:import [com.zaxxer.nuprocess NuProcess NuProcessBuilder NuProcessHandler]
            [java.nio ByteBuffer CharBuffer]
            [java.nio.charset Charset CoderResult]
-           [java.util.regex Pattern]))
+           [java.util.regex Pattern]
+           (java.util List)))
 
 (defmacro go-ex [& body]
   `(go
      (try
        ~@body
-       (catch Exception e
-         (timbre/error e)))))
+       (catch Exception e#
+         (timbre/error e#)))))
 
 (def ^:dynamic *working-buffer-size*
   "Initial size of the destination buffer for reads. Will be reallocated with a larger size as-needed."
@@ -29,11 +30,12 @@
     (.get buffer dest)
     dest))
 
-(defn run-process [argv & {:keys [shutdown-chan]}]
+(defn run-process [argv & [{:keys [shutdown-chan environment]}]]
   "Run a process with the given argv, and return a dictionary with access to the process object itself and channels for controlling it.
 
   Accepts the following optional keyword arguments:
   - `shutdown-chan`: use a preexisting channel to force shutdown
+  - `environment`  : environment to pass on to process
 
   Returns a dictionary with the following keys:
   - `:process` - a NuProcess object
@@ -56,16 +58,16 @@
                                                  channels))]
                              (timbre/trace "callback write result: " v "," c)
                              (cond
-                              (= c dest-chan)
-                              (timbre/trace "successful write to" dest-name)
+                               (= c dest-chan)
+                               (timbre/trace "successful write to" dest-name)
 
-                              (= c shutdown-chan)
-                              (timbre/trace "write to" dest-name "interrupted by shutdown")
+                               (= c shutdown-chan)
+                               (timbre/trace "write to" dest-name "interrupted by shutdown")
 
-                              :else
-                              (do
-                                (timbre/error "timeout occurred in callback writing to" dest-name "-- shutting down")
-                                (let [^NuProcess p @process-atom] (.destroy p)))))))]
+                               :else
+                               (do
+                                 (timbre/error "timeout occurred in callback writing to" dest-name "-- shutting down")
+                                 (let [^NuProcess p @process-atom] (.destroy p)))))))]
     (let [^NuProcessHandler handler
           (proxy [NuProcessHandler] []
             (onStart [process]
@@ -90,25 +92,26 @@
               (let [^NuProcess process @process-atom]
                 (.closeStdin process))
               false))
-          ^java.util.List argv-list (apply list argv)
-          builder (NuProcessBuilder. handler argv-list)]
+          ^List argv-list (apply list argv)
+          builder (NuProcessBuilder. handler argv-list)
+          _ (.. builder (environment) (putAll environment))]
       (let [process (.start builder)]
         (go-ex
           (loop []
             (let [[v c] (alts! [in-chan shutdown-chan])]
               (cond
-               (= c in-chan)
-               (if v
-                 (do
-                   (timbre/trace "Writing" (alength ^bytes v) "bytes to process")
-                   (.writeStdin process (ByteBuffer/wrap v))
-                   (recur))
-                 (do
-                   (timbre/trace "stdin stream ended; telling NuProcess to callback after flush")
-                   (.wantWrite process)))
+                (= c in-chan)
+                (if v
+                  (do
+                    (timbre/trace "Writing" (alength ^bytes v) "bytes to process")
+                    (.writeStdin process (ByteBuffer/wrap v))
+                    (recur))
+                  (do
+                    (timbre/trace "stdin stream ended; telling NuProcess to callback after flush")
+                    (.wantWrite process)))
 
-               :else
-               (timbre/trace "shutdown chan triggered; ending input goroutine")))))
+                :else
+                (timbre/trace "shutdown chan triggered; ending input goroutine")))))
         {:process process
          :in in-chan
          :out out-chan
@@ -119,54 +122,54 @@
 (defn decode-chars
   "given a stream of byte arrays, emit a stream of CharBuffers"
   ([in-chan]
-     (decode-chars in-chan (Charset/forName "utf8")))
+   (decode-chars in-chan (Charset/forName "utf8")))
   ([in-chan, ^Charset charset]
-     (let [out-chan (chan)
-           decoder (.newDecoder charset)]
-       (go-ex
-         (loop [^ByteBuffer working-buffer (ByteBuffer/allocate *working-buffer-size*) ; compacted and ready to receive writes
-                ^bytes in-bytes (<! in-chan)]
-           (timbre/trace "decoder: starting loop with working buffer " working-buffer " processing content " in-bytes)
-           (cond
-            (nil? in-bytes)
-            (do
-              (.flip ^ByteBuffer working-buffer) ; use as a source
-              (timbre/trace "decoder: end of input stream seen; flushing the rest of " working-buffer)
-              (let [out-buffer (CharBuffer/allocate (.remaining ^ByteBuffer working-buffer))
-                    decode-result (.decode decoder ^ByteBuffer working-buffer ^CharBuffer out-buffer true)]
+   (let [out-chan (chan)
+         decoder (.newDecoder charset)]
+     (go-ex
+       (loop [^ByteBuffer working-buffer (ByteBuffer/allocate *working-buffer-size*) ; compacted and ready to receive writes
+              ^bytes in-bytes (<! in-chan)]
+         (timbre/trace "decoder: starting loop with working buffer " working-buffer " processing content " in-bytes)
+         (cond
+           (nil? in-bytes)
+           (do
+             (.flip ^ByteBuffer working-buffer) ; use as a source
+             (timbre/trace "decoder: end of input stream seen; flushing the rest of " working-buffer)
+             (let [out-buffer (CharBuffer/allocate (.remaining ^ByteBuffer working-buffer))
+                   decode-result (.decode decoder ^ByteBuffer working-buffer ^CharBuffer out-buffer true)]
 
-                (.flush decoder ^CharBuffer out-buffer)
-                (.flip out-buffer)
-                (when (pos? (.remaining out-buffer))
-                  (>! out-chan out-buffer))
-                (close! out-chan))
-              nil)
+               (.flush decoder ^CharBuffer out-buffer)
+               (.flip out-buffer)
+               (when (pos? (.remaining out-buffer))
+                 (>! out-chan out-buffer))
+               (close! out-chan))
+             nil)
 
-            (< (.remaining ^ByteBuffer working-buffer) (alength ^bytes in-bytes))
-            (do
-              (timbre/trace "decoder: resizing working buffer;" (.remaining ^ByteBuffer working-buffer)
-                            "bytes left of" (alength ^bytes in-bytes) "needed")
-              (let [new-working-buffer (ByteBuffer/allocate (+ *working-buffer-size*
-                                                               (.capacity ^ByteBuffer working-buffer)
-                                                               (alength ^bytes in-bytes)))]
-                (.flip ^ByteBuffer working-buffer) ; use as a source for copy
-                (.put ^ByteBuffer new-working-buffer ^ByteBuffer working-buffer)
-                (recur new-working-buffer in-bytes)))
+           (< (.remaining ^ByteBuffer working-buffer) (alength ^bytes in-bytes))
+           (do
+             (timbre/trace "decoder: resizing working buffer;" (.remaining ^ByteBuffer working-buffer)
+                           "bytes left of" (alength ^bytes in-bytes) "needed")
+             (let [new-working-buffer (ByteBuffer/allocate (+ *working-buffer-size*
+                                                              (.capacity ^ByteBuffer working-buffer)
+                                                              (alength ^bytes in-bytes)))]
+               (.flip ^ByteBuffer working-buffer) ; use as a source for copy
+               (.put ^ByteBuffer new-working-buffer ^ByteBuffer working-buffer)
+               (recur new-working-buffer in-bytes)))
 
-            :else
-            (do
-              (timbre/trace "decoder: running a regular cycle; in-bytes " in-bytes ", working-buffer " working-buffer)
-              (.put ^ByteBuffer working-buffer ^bytes in-bytes)
-              (.flip ^ByteBuffer working-buffer) ; use a source for decoding
-              (timbre/trace "working-buffer" working-buffer "populated for decode:"
-                            (seq (array-from-buffer (.duplicate ^ByteBuffer working-buffer))))
-              (let [out-buffer (CharBuffer/allocate (.remaining ^ByteBuffer working-buffer))
-                    decode-result (.decode decoder ^ByteBuffer working-buffer ^CharBuffer out-buffer false)]
-                (timbre/trace "Decoding into" out-buffer
-                              "of size" (.capacity ^CharBuffer out-buffer)
-                              "resulted in" decode-result
-                              "with" (.position out-buffer) "characters decoded")
-                (cond
+           :else
+           (do
+             (timbre/trace "decoder: running a regular cycle; in-bytes " in-bytes ", working-buffer " working-buffer)
+             (.put ^ByteBuffer working-buffer ^bytes in-bytes)
+             (.flip ^ByteBuffer working-buffer) ; use a source for decoding
+             (timbre/trace "working-buffer" working-buffer "populated for decode:"
+                           (seq (array-from-buffer (.duplicate ^ByteBuffer working-buffer))))
+             (let [out-buffer (CharBuffer/allocate (.remaining ^ByteBuffer working-buffer))
+                   decode-result (.decode decoder ^ByteBuffer working-buffer ^CharBuffer out-buffer false)]
+               (timbre/trace "Decoding into" out-buffer
+                             "of size" (.capacity ^CharBuffer out-buffer)
+                             "resulted in" decode-result
+                             "with" (.position out-buffer) "characters decoded")
+               (cond
                  (or (= decode-result CoderResult/UNDERFLOW)
                      (= decode-result CoderResult/OVERFLOW))
                  (do
@@ -183,7 +186,7 @@
                        (timbre/error e "Ending decode due to error")))
                    (close! out-chan)
                    nil)))))))
-       out-chan)))
+     out-chan)))
 
 (defn split-by-char [in-chan delim-char]
   "given a channel delivering character arrays, merge and split by a delimiter"
@@ -225,16 +228,16 @@
 
   When given a character to split by, log only when a complete character-delimited buffer is received, or at end-of-stream."
   ([in-chan]
-     (go
-       (loop [char-buffer-in (<! in-chan)]
-         (when char-buffer-in
-           (timbre/info "Read string: " (str char-buffer-in))
-           (recur (<! in-chan))))))
+   (go
+     (loop [char-buffer-in (<! in-chan)]
+       (when char-buffer-in
+         (timbre/info "Read string: " (str char-buffer-in))
+         (recur (<! in-chan))))))
   ([in-chan split-char]
-     (let [str-chan (split-by-char in-chan split-char)]
-       (go (loop [string-in (<! str-chan)]
-             (timbre/info "Read string: " string-in)
-             (recur (<! str-chan)))))))
+   (let [str-chan (split-by-char in-chan split-char)]
+     (go (loop [string-in (<! str-chan)]
+           (timbre/info "Read string: " string-in)
+           (recur (<! str-chan)))))))
 
 
 (defn write-str-to-process [proc-dict, ^String s]
@@ -250,12 +253,12 @@
 (defn wait-for-process
   "Block until a process exits, or an optional timeout occurs; return exit status, or nil for timeout"
   ([proc-dict]
-     (<!! (:exit proc-dict)))
+   (<!! (:exit proc-dict)))
   ([proc-dict timeout-ms]
-     (let [exit-chan (:exit proc-dict)
-           [v c] (alts!! [exit-chan (timeout timeout-ms)])]
-       (when (= c exit-chan)
-         v))))
+   (let [exit-chan (:exit proc-dict)
+         [v c] (alts!! [exit-chan (timeout timeout-ms)])]
+     (when (= c exit-chan)
+       v))))
 
 (defn shutdown-process
   "Force process to shut down immediately by closing its shutdown channel.
